@@ -29,6 +29,7 @@ import datetime
 import calendar
 import hashlib
 from six.moves.urllib.parse import urlparse, urlencode
+from requests.utils import get_netrc_auth
 
 try:
     from collections import OrderedDict
@@ -58,11 +59,11 @@ from .resources import Resource, Issue, Comment, Project, Attachment, Component,
     Worklog, IssueLink, IssueLinkType, IssueType, Priority, Version, Role, Resolution, SecurityLevel, Status, User, \
     CustomFieldOption, RemoteLink
 # GreenHopper specific resources
-from .resources import GreenHopperResource, Board, Sprint
+from .resources import Board, Sprint
 from .resilientsession import ResilientSession
 from .version import __version__
-from .utils import threaded_requests, json_loads, JIRAError, CaseInsensitiveDict
-
+from .utils import threaded_requests, json_loads, CaseInsensitiveDict
+from .exceptions import JIRAError
 try:
     from random import SystemRandom
 
@@ -270,6 +271,12 @@ class JIRA(object):
         if self._options['check_update'] and not JIRA.checked_version:
             self._check_update_()
             JIRA.checked_version = True
+
+        # TODO: check if this works with non-admin accounts
+        self._fields = {}
+        for f in self.fields():
+            for name in f['clauseNames']:
+                self._fields[name] = f['id']
 
     def _check_update_(self):
         # check if the current version of the library is outdated
@@ -1570,6 +1577,21 @@ class JIRA(object):
         if fields is None:
             fields = []
 
+        if isinstance(fields, basestring):
+            if "," in fields:
+                fields = fields.split(",")
+            else:
+                fields = [fields]
+
+        # this will translate JQL field names to REST API Name
+        # most people do know the JQL names so this will help them use the API easier
+        untranslate = {}  # use to add friendly aliases when we get the results back
+        if self._fields:
+            for i, field in enumerate(fields):
+                if field in self._fields:
+                    untranslate[self._fields[field]] = fields[i]
+                    fields[i] = self._fields[field]
+
         # If None is passed as parameter, this fetch all issues from the query
         if not maxResults:
             maxResults = maxi
@@ -1600,6 +1622,13 @@ class JIRA(object):
                                resource['issues']]
                 issues.extend(issue_batch)
                 cnt = len(issue_batch)
+
+        if untranslate:
+            for i in issues:
+                for k, v in untranslate.iteritems():
+                    if k in i.raw['fields']:
+                        i.raw['fields'][v] = i.raw['fields'][k]
+
         return ResultList(issues, total)
 
     # Security levels
@@ -2058,7 +2087,7 @@ class JIRA(object):
             try:
                 _magic = magic.Magic(flags=magic.MAGIC_MIME_TYPE)
 
-                def cleanup():
+                def cleanup(x):
                     _magic.close()
                 self._magic_weakref = weakref.ref(self, cleanup)
                 self._magic = _magic
@@ -2317,6 +2346,10 @@ class JIRA(object):
 
     def _gain_sudo_session(self, options, destination):
         url = self._options['server'] + '/secure/admin/WebSudoAuthenticate.jspa'
+
+        if not self._session.auth:
+            self._session.auth = get_netrc_auth(url)
+
         payload = {
             'webSudoPassword': self._session.auth[1],
             'webSudoDestination': destination,
@@ -2328,7 +2361,7 @@ class JIRA(object):
         return self._session.post(
             url, headers=CaseInsensitiveDict({'content-type': 'application/x-www-form-urlencoded'}), data=payload)
 
-    def create_project(self, key, name=None, assignee=None):
+    def create_project(self, key, name=None, assignee=None, type="Software"):
         """
         Key is mandatory and has to match JIRA project key requirements, usually only 2-10 uppercase characters.
         If name is not specified it will use the key value.
@@ -2372,6 +2405,10 @@ class JIRA(object):
                    #'assigneeType': '2',
                    }
 
+        if self._version[0] > 6:
+            # JIRA versions before 7 will throw an error if we specify type parameter
+            payload['type'] = type
+
         headers = CaseInsensitiveDict(
             {'Content-Type': 'application/x-www-form-urlencoded'})
 
@@ -2391,7 +2428,27 @@ class JIRA(object):
                     f.name, r.status_code))
         return False
 
-    def add_user(self, username, email, directoryId=1, password=None, fullname=None, active=True):
+    def add_user(self, username, email, directoryId=1, password=None,
+                 fullname=None, notify=False, active=True):
+        '''
+        Creates a new JIRA user
+
+        :param username: the username of the new user
+        :type username: ``str``
+        :param email: email address of the new user
+        :type email: ``str``
+        :param directoryId: the directory ID the new user should be a part of
+        :type directoryId: ``int``
+        :param password: Optional, the password for the new user
+        :type password: ``str``
+        :param fullname: Optional, the full name of the new user
+        :type fullname: ``str``
+        :param notify: Whether or not to send a notification to the new user
+        :type notify ``bool``
+        :param active: Whether or not to make the new user active upon creation
+        :type active: ``bool``
+        :return:
+        '''
 
         if not fullname:
             fullname = username
@@ -2408,6 +2465,8 @@ class JIRA(object):
         x['name'] = username
         if password:
             x['password'] = password
+        if notify:
+            x['notification'] = 'True'
 
         payload = json.dumps(x)
 
@@ -2531,7 +2590,7 @@ class JIRA(object):
                     "Fatal error, duplicate Sprint Name (%s) found on board %s." % (s.name, id)))
         return sprints
 
-    def update_sprint(self, id, name=None, startDate=None, endDate=None):
+    def update_sprint(self, id, name=None, startDate=None, endDate=None, state=None):
         payload = {}
         if name:
             payload['name'] = name
@@ -2539,8 +2598,8 @@ class JIRA(object):
             payload['startDate'] = startDate
         if endDate:
             payload['startDate'] = endDate
-        # if state:
-        #    payload['state']=state
+        if state:
+            payload['state'] = state
 
         url = self._get_url('sprint/%s' % id, base=self.AGILE_BASE_URL)
         r = self._session.put(
@@ -2692,12 +2751,12 @@ class JIRA(object):
         :param sprint_id: the sprint to add issues to
         :param issue_keys: the issues to add to the sprint
         """
-        
+
         # Get the customFieldId for "Sprint"
         sprint_field_name = "Sprint"
         sprint_field_id = [f['schema']['customId'] for f in self.fields()
                            if f['name'] == sprint_field_name][0]
-        
+
         data = {}
         data['idOrKeys'] = issue_keys
         data['customFieldId'] = sprint_field_id

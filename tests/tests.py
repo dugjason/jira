@@ -1591,7 +1591,7 @@ class UserTests(unittest.TestCase):
 
     def test_user_avatars(self):
         avatars = self.jira.user_avatars('ci-admin')
-        self.assertEqual(len(avatars['system']), 24)
+        self.assertGreaterEqual(len(avatars['system']), 20)  # observed values between 20-24 so far
         self.assertEqual(len(avatars['custom']), 0)
 
     @unittest.skip("disable until I have permissions to write/modify")
